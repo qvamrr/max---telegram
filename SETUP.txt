@@ -1,0 +1,184 @@
+MAX -> Telegram bot (polling) — инструкция
+
+1) Что это
+  Скрипт каждые N секунд опрашивает API MAX и пересылает новые сообщения в Telegram.
+  Дубли не отправляет: хранит last_message_id в файле.
+  Есть админ-команды в Telegram через polling getUpdates:
+    /admin, /stats, /set_interval <сек>, /last_id, /reload, /test
+
+2) Файлы проекта
+  - max_to_telegram.py        основной скрипт
+  - requirements.txt          зависимости
+  - .env                      локальный конфиг с токенами и настройками
+  - last_message_id.json      создастся автоматически (хранит last_message_id)
+  - telegram_offset.json      создастся автоматически (offset для getUpdates)
+
+3) Как получить токен MAX (MAX_API_TOKEN) через браузер
+  1) Откройте https://web.max.ru и войдите в аккаунт (по QR или по номеру + код).
+  2) Откройте инструменты разработчика (F12).
+  3) Перейдите на вкладку Application (Chrome) или Storage (Firefox).
+  4) Слева выберите Local Storage -> https://web.max.ru (или текущий домен).
+  5) В списке ключей найдите данные авторизации, например:
+       - _oneme_auth — часто это JSON с полем token или auth_token;
+       - или ключи с названиями вроде token, auth_token, login_token.
+  6) Скопируйте значение токена:
+       - если это JSON (часто _oneme_auth) — можно копировать ВЕСЬ JSON целиком;
+         бот сам попробует вытащить правильный токен (tokenAttrs.LOGIN.token / auth_token / token).
+       - если видите только строку токена (начинается с An_ или eyJ...) — копируйте её.
+  7) На VDS впишите токен в файл .env как MAX_API_TOKEN=ВАШ_ТОКЕН
+
+3.1) Как получить ID чата в MAX (MAX_CHAT_ID)
+  1) Откройте веб-версию MAX: https://web.max.ru
+  2) Перейдите в чат, из которого нужно забирать сообщения.
+  3) Посмотрите на адресную строку:
+       https://web.max.ru/ID_ЧАТА
+     Последняя часть URL — это и есть ID_ЧАТА.
+  4) Впишите этот ID в .env как:
+       MAX_CHAT_ID=ID_ЧАТА
+
+4) Файл конфигурации .env (в него вписываем все токены и настройки)
+  В корне проекта (папка max_to_telegram_bot) создайте файл .env и добавьте в него строки:
+
+    MAX_API_TOKEN=ТОКЕН_ИЗ_web.max.ru
+    MAX_CHAT_ID=ID_ЧАТА_ИЗ_URL
+    TELEGRAM_BOT_TOKEN=ВАШ_TG_BOT_TOKEN
+    TELEGRAM_CHAT_ID=-1001234567890
+    ADMIN_TELEGRAM_ID=123456789
+    POLL_INTERVAL=5
+    # PROXY_URL=socks5h://host:port
+    # PROXY_USERNAME=user
+    # PROXY_PASSWORD=pass
+
+  URL, по которому скрипт забирает сообщения, зашивается прямо в max_to_telegram.py
+  внутри функции fetch_messages_from_max (переменная url). Его не нужно указывать в .env.
+
+  Бот при запуске читает .env автоматически:
+    - локально, если .env лежит рядом со скриптом;
+    - на VDS через EnvironmentFile в systemd (см. пункт 7.4).
+
+5) Прокси (опционально, только для Telegram)
+  PROXY_URL              например:
+                          - http://host:port
+                          - socks5h://host:port
+  PROXY_USERNAME         логин (если нужен)
+  PROXY_PASSWORD         пароль (если нужен)
+
+  ВАЖНО: для SOCKS5 в requests нужно:
+    pip install "requests[socks]"
+    или установите pysocks (он уже добавлен в requirements.txt этого проекта)
+
+6) Запуск на Windows (локально)
+  1) Откройте PowerShell в папке проекта:
+       cd "\max_to_telegram_bot"
+  2) Установите зависимости:
+       python -m pip install -r requirements.txt
+  3) Задайте переменные окружения (пример):
+       setx MAX_API_URL "https://ваш.max/api/messages"
+       setx MAX_API_TOKEN "ВАШ_MAX_TOKEN"
+       setx TELEGRAM_BOT_TOKEN "ВАШ_TG_BOT_TOKEN"
+       setx TELEGRAM_CHAT_ID "-1001234567890"
+       setx ADMIN_TELEGRAM_ID "123456789"
+     Перезапустите PowerShell, чтобы setx применился.
+  4) Запустите:
+       python max_to_telegram.py
+
+7) Деплой на VDS (Ubuntu/Debian) + автозапуск через systemd
+  Предполагаем, что у вас уже есть доступ по SSH к серверу.
+
+  7.1 Установить Python
+    sudo apt update
+    sudo apt install -y python3 python3-venv python3-pip
+
+  7.2 Скопировать проект на сервер
+    Вариант A (scp):
+      scp -r "./max_to_telegram_bot" user@YOUR_SERVER_IP:/opt/
+      sudo chown -R root:root /opt/max_to_telegram_bot
+
+    Вариант B (git) — если вы заведёте репозиторий позже.
+
+  7.3 Создать виртуальное окружение и поставить зависимости
+    cd /opt/max_to_telegram_bot
+    python3 -m venv .venv
+    ./.venv/bin/python -m pip install --upgrade pip
+    ./.venv/bin/python -m pip install -r requirements.txt
+
+  7.3.1 (Рекомендуется) Быстрый ручной запуск для проверки ДО systemd
+    1) Загрузите переменные окружения из .env:
+         set -a
+         source /opt/max_to_telegram_bot/.env
+         set +a
+    2) Запустите бота в консоли:
+         /opt/max_to_telegram_bot/.venv/bin/python /opt/max_to_telegram_bot/max_to_telegram.py
+    3) Остановить: Ctrl+C
+
+  7.4 Создать файл окружения для systemd
+    sudo nano /max_to_telegram_bot/.env
+
+    Пример содержимого .env:
+      MAX_API_URL=https://ваш.max/api/messages
+      MAX_API_TOKEN=ВАШ_MAX_TOKEN
+      TELEGRAM_BOT_TOKEN=ВАШ_TG_BOT_TOKEN
+      TELEGRAM_CHAT_ID=-1001234567890
+      ADMIN_TELEGRAM_ID=123456789
+      POLL_INTERVAL=5
+      # PROXY_URL=socks5h://host:port
+      # PROXY_USERNAME=user
+      # PROXY_PASSWORD=pass
+
+    Защитите файл:
+      sudo chmod 600 /opt/max_to_telegram_bot/.env
+
+  7.5 Создать systemd unit
+    sudo nano /etc/systemd/system/max-to-telegram.service
+
+    Вставьте:
+      [Unit]
+      Description=MAX to Telegram forwarder (polling)
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      WorkingDirectory=/opt/max_to_telegram_bot
+      EnvironmentFile=/opt/max_to_telegram_bot/.env
+      ExecStart=/opt/max_to_telegram_bot/.venv/bin/python /opt/max_to_telegram_bot/max_to_telegram.py
+      Restart=always
+      RestartSec=3
+
+      # Логи:
+      StandardOutput=journal
+      StandardError=journal
+
+      [Install]
+      WantedBy=multi-user.target
+
+  7.6 Запуск и включение автозапуска
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now max-to-telegram.service
+
+  7.7 Просмотр логов
+    sudo journalctl -u max-to-telegram.service -f
+
+  7.8 Полезные команды управления сервисом
+    sudo systemctl status max-to-telegram.service
+    sudo systemctl restart max-to-telegram.service
+    sudo systemctl stop max-to-telegram.service
+
+8) Как узнать TELEGRAM_CHAT_ID
+  Самый простой способ:
+    - добавьте бота в целевую группу;
+    - напишите любое сообщение в группе;
+    - откройте в браузере:
+        https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getUpdates
+    - найдите в JSON поле message.chat.id — это и есть TELEGRAM_CHAT_ID.
+
+9) Безопасность
+  - Не публикуйте MAX_API_TOKEN и TELEGRAM_BOT_TOKEN.
+  - На VDS храните токены в .env с правами 600.
+  - Админ-команды доступны только ADMIN_TELEGRAM_ID.
+
+10) Быстрый тест
+  - Запустите бота.
+  - В личку боту (с вашего ADMIN_TELEGRAM_ID) отправьте: /admin
+  - Затем /test — он должен написать в группу.
+

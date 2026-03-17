@@ -1,0 +1,171 @@
+import json, time
+from typing import Literal
+
+EMOJIS = Literal[
+    "❤️","👍","🤣","🔥","💯","😍","🎉","⚡",
+    "🤩","🤘","😎","🙄","😐","😁","🤪","😉",
+    "🤤","😇","😘","🥰","🥳","🌚","🌝","😴",
+    "🫠","🤔","🫡","😳","🥱","🐈","🐶","💪",
+    "🤞","👋","👏","🤝","👌","🙏","💋","👑",
+    "⭐","🍷","🍑","🤷‍♀️","🤷‍♂️","👩‍❤️‍👨","🦄","👻",
+    "🗿","👀","👁️","🖤","❤️‍🩹","🛑","⛄","❓",
+    "❗️"
+]
+
+
+class Name:
+    def __init__(self, **kwargs):
+        self.name = kwargs.get("name")
+        self.first_name = kwargs.get("firstName")
+        self.last_name = kwargs.get("lastName")
+        self.type = kwargs.get("type")
+
+
+class Contact:
+    def __init__(
+        self,
+        client,
+        accountStatus=None,
+        baseUrl=None,
+        names=None,
+        phone=None,
+        description=None,
+        options=None,
+        photoId=None,
+        updateTime=None,
+        id=None,
+        baseRawUrl=None,
+        gender=None,
+        link=None,
+        **kwargs,
+    ):
+        self._client = client
+        self.accountStatus = accountStatus
+        self.base_url = baseUrl
+        self.names = [Name(**n) for n in names] if names else []
+        self.phone = phone
+        self.description = description
+        self.options = options
+        self.photo_id = photoId
+        self.update_time = updateTime
+        self.id = id
+        self.link = link
+        self.gender = gender
+        self.base_raw_url = baseRawUrl
+
+    def add(self):
+        return self._client.contact_add(self.id)
+
+    def remove(self):
+        return self._client.contact_remove(self.id)
+
+    def block(self):
+        return self._client.contact_block(self.id)
+
+    def unblock(self):
+        return self._client.contact_unblock(self.id)
+
+
+class User:
+    def __init__(self, client, profile, _f=0):
+        self._client = client
+        self.contact = Contact(client, **profile)
+        _id = client.me.contact.id if client.me else profile["id"]
+        if not _f:
+            self.chat = Chat(self._client, profile["id"] ^ _id)
+
+
+class Chat:
+    def __init__(self, client, chat_id):
+        if chat_id == 0:
+            return
+        self._client = client
+        self.id: int = chat_id
+        self.link = f"https://web.max.ru/{chat_id}"
+
+        seq = client.seq
+        client.websocket.send(
+            json.dumps(
+                {
+                    "ver": 11,
+                    "cmd": 0,
+                    "seq": seq,
+                    "opcode": 49,
+                    "payload": {
+                        "chatId": chat_id,
+                        "from": int(time.time() * 1000),
+                        "forward": 0,
+                        "backward": 30,
+                        "getMessages": True,
+                    },
+                }
+            )
+        )
+        while True:
+            r = client.websocket.recv()
+            recv = json.loads(r)
+            if recv["seq"] == seq and recv["opcode"] == 49:
+                break
+
+        payload = recv["payload"]
+        _ = []
+        for msg in payload.get("messages", []):
+            m = Message(client, 0, **msg, _f=1)
+            _.append(m)
+        self.messages: list[Message] = _
+
+    def pin(self):
+        self._client.pin_chat(self.id)
+
+    def unpin(self):
+        self._client.unpin_chat(self.id)
+
+
+class Message:
+    def __init__(self, client, chatId: str, sender: str, id, time, text, type, _f=0, **kwargs):
+        self._client = client
+        self.kwargs = kwargs
+        self.status = kwargs.get("status")
+        if not _f:
+            self.chat = Chat(client, chatId)
+        self.sender = sender
+        self.id = id
+        self.time = time
+        self.text = text
+        self.type = type
+        self.update_time = kwargs.get("updateTime")
+        self.options = kwargs.get("options")
+        self.cid = kwargs.get("cid")
+        self.attaches = kwargs.get("attaches", [])
+        self.reaction_info = kwargs.get("reactionInfo", {})
+        self.user: User = client.get_user(id=sender, _f=1)
+
+    def reply(self, text: str, **kwargs) -> "Message":
+        return self._client.send_message(self.chat.id, text, self.id, **kwargs)
+
+    def answer(self, text: str, **kwargs) -> "Message":
+        return self._client.send_message(self.chat.id, text, **kwargs)
+
+    def delete(self, for_me=False):
+        return self._client.delete_message(self.chat.id, [self.id], for_me)
+
+    def edit(self, text: str) -> "Message":
+        return self._client.edit_message(self.chat.id, self.id, text)
+
+    def react(self, reaction: EMOJIS):
+        return self._client.set_reaction(self.chat.id, self.id, reaction)
+
+
+class Reaction:
+    def __init__(self, reaction: str, count: int):
+        self.reaction = reaction
+        self.count = count
+
+
+class Reactions:
+    def __init__(self, **kwargs):
+        reaction_info = kwargs.get("reactionInfo", {})
+        self.counters = [Reaction(**c) for c in reaction_info.get("counters", [])]
+        self.your_reaction = reaction_info.get("yourReaction")
+        self.total_count = reaction_info.get("totalCount")
+
