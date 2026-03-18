@@ -23,6 +23,7 @@ import sys
 import threading
 from typing import List
 import html
+from collections import deque
 
 
 # Попробуем включить UTF-8 на stdout/stderr (Windows-консоль)
@@ -119,6 +120,8 @@ except ValueError:
 
 # Файл для сохранения MAX_CHAT_IDS, чтобы можно было добавлять через админ-панель
 MAX_CHAT_IDS_FILE = os.path.join(BASE_DIR, "max_chat_ids.json")
+ADMIN_STATE_FILE = os.path.join(BASE_DIR, "admin_state.json")
+BOT_VERSION = "1.0.0"
 
 
 def load_max_chat_ids() -> List[int]:
@@ -203,12 +206,69 @@ def _ts() -> str:
 def log(msg: str) -> None:
     print(f"[{_ts()}] {msg}", flush=True)
 
+def _append_event(runtime_state: dict, text: str) -> None:
+    try:
+        runtime_state["events"].append(f"[{_ts()}] {text}")
+    except Exception:
+        pass
+
+def _append_error(runtime_state: dict, text: str) -> None:
+    try:
+        runtime_state["errors"].append(f"[{_ts()}] {text}")
+    except Exception:
+        pass
+
+def load_admin_state() -> dict:
+    """
+    Загружает состояние админки (tg_chat_id, admins, muted, flags) из admin_state.json.
+    Формат:
+      {
+        "telegram_chat_id": "-100...",
+        "admins": [123, 456],
+        "muted_chats": [-1, -2],
+        "forwarding_enabled": true,
+        "only_text": false,
+        "loglevel": "info"
+      }
+    """
+    try:
+        if not os.path.exists(ADMIN_STATE_FILE):
+            return {}
+        with open(ADMIN_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.loads(f.read() or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def save_admin_state(runtime_state: dict) -> None:
+    try:
+        data = {
+            "telegram_chat_id": runtime_state.get("telegram_chat_id", ""),
+            "admins": sorted(list(set(int(x) for x in runtime_state.get("admins", []) if str(x).isdigit()))),
+            "muted_chats": sorted(list(set(int(x) for x in runtime_state.get("muted_chats", [])))),
+            "forwarding_enabled": bool(runtime_state.get("forwarding_enabled", True)),
+            "only_text": bool(runtime_state.get("only_text", False)),
+            "loglevel": runtime_state.get("loglevel", "info"),
+        }
+        tmp = ADMIN_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, ensure_ascii=False))
+        os.replace(tmp, ADMIN_STATE_FILE)
+    except Exception as e:
+        log(f"Не удалось сохранить {ADMIN_STATE_FILE}: {e}")
 
 # ============================================================
 # Telegram helpers (для текста и админки)
 # ============================================================
 
-TG_TIMEOUT_SECONDS = 15.0
+# Таймауты Telegram через прокси обычно должны быть больше.
+# Используем раздельные таймауты: connect/read.
+TG_CONNECT_TIMEOUT_SECONDS = 30.0
+TG_READ_TIMEOUT_SECONDS = 90.0
+
+# Long polling timeout для getUpdates (сек).
+# Telegram будет держать запрос до этого времени, если нет обновлений.
+TG_GETUPDATES_LONGPOLL_SECONDS = 25
 
 
 def _build_proxy_url() -> str | None:
@@ -244,7 +304,7 @@ def send_text_to_telegram(session: requests.Session, chat_id: str, text: str, pa
         payload["parse_mode"] = parse_mode
 
     try:
-        resp = session.post(url, data=payload, timeout=TG_TIMEOUT_SECONDS)
+        resp = session.post(url, data=payload, timeout=(TG_CONNECT_TIMEOUT_SECONDS, TG_READ_TIMEOUT_SECONDS))
         STATS["last_tg_http_status"] = resp.status_code
     except requests.exceptions.Timeout:
         log("Telegram: timeout при отправке.")
@@ -275,34 +335,58 @@ def send_text_to_telegram(session: requests.Session, chat_id: str, text: str, pa
 # ============================================================
 
 def process_admin_commands(session: requests.Session, last_update_id: int, runtime_state: dict) -> int:
-    if not TELEGRAM_BOT_TOKEN or not ADMIN_TELEGRAM_ID:
+    if not TELEGRAM_BOT_TOKEN:
         return last_update_id
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {"offset": last_update_id + 1, "timeout": 0}
+    # Long polling уменьшает количество коротких запросов через прокси
+    params = {"offset": last_update_id + 1, "timeout": TG_GETUPDATES_LONGPOLL_SECONDS}
 
     try:
-        resp = session.get(url, params=params, timeout=TG_TIMEOUT_SECONDS)
+        resp = session.get(url, params=params, timeout=(TG_CONNECT_TIMEOUT_SECONDS, TG_READ_TIMEOUT_SECONDS))
     except requests.exceptions.RequestException as e:
         # Важно логировать: иначе кажется, что бот "не реагирует"
         log(f"Telegram getUpdates error: {e}")
-        if "SOCKS" in str(e).upper() or "PYTHON-SOCKS" in str(e).upper() or "PySocks" in str(e):
-            log("Подсказка: для socks5 прокси установите pysocks (pip install pysocks) и перезапустите сервис.")
+        _append_error(runtime_state, f"getUpdates error: {e}")
+        # Backoff на случай нестабильного прокси/сети
+        prev = int(runtime_state.get("tg_backoff_sec", 0))
+        runtime_state["tg_backoff_sec"] = 5 if prev <= 0 else min(60, prev * 2)
+        if runtime_state["tg_backoff_sec"] != prev:
+            log(f"Telegram backoff: {runtime_state['tg_backoff_sec']} sec")
         return last_update_id
 
     if resp.status_code != 200:
         log(f"Telegram getUpdates HTTP {resp.status_code}: {(resp.text or '')[:200]}")
+        _append_error(runtime_state, f"getUpdates HTTP {resp.status_code}: {(resp.text or '')[:200]}")
+        prev = int(runtime_state.get("tg_backoff_sec", 0))
+        runtime_state["tg_backoff_sec"] = 5 if prev <= 0 else min(60, prev * 2)
+        if runtime_state["tg_backoff_sec"] != prev:
+            log(f"Telegram backoff: {runtime_state['tg_backoff_sec']} sec")
         return last_update_id
 
     try:
         data = resp.json()
     except Exception:
         log("Telegram getUpdates: invalid JSON response")
+        _append_error(runtime_state, "getUpdates invalid JSON response")
+        prev = int(runtime_state.get("tg_backoff_sec", 0))
+        runtime_state["tg_backoff_sec"] = 5 if prev <= 0 else min(60, prev * 2)
+        if runtime_state["tg_backoff_sec"] != prev:
+            log(f"Telegram backoff: {runtime_state['tg_backoff_sec']} sec")
         return last_update_id
 
     if not data.get("ok"):
         log(f"Telegram getUpdates ok=false: {str(data)[:200]}")
+        _append_error(runtime_state, f"getUpdates ok=false: {str(data)[:200]}")
+        prev = int(runtime_state.get("tg_backoff_sec", 0))
+        runtime_state["tg_backoff_sec"] = 5 if prev <= 0 else min(60, prev * 2)
+        if runtime_state["tg_backoff_sec"] != prev:
+            log(f"Telegram backoff: {runtime_state['tg_backoff_sec']} sec")
         return last_update_id
+
+    # success -> сбрасываем backoff
+    if runtime_state.get("tg_backoff_sec"):
+        runtime_state["tg_backoff_sec"] = 0
 
     updates = data.get("result", [])
     if not updates:
@@ -321,7 +405,17 @@ def process_admin_commands(session: requests.Session, last_update_id: int, runti
         user_id = from_user.get("id")
         text = (message.get("text") or "").strip()
 
-        if not text or int(user_id or 0) != int(ADMIN_TELEGRAM_ID):
+        if not text:
+            continue
+
+        # /whoami доступен всем (чтобы узнать свой id)
+        if text.startswith("/whoami"):
+            send_text_to_telegram(session, str(user_id), f"Ваш Telegram ID: {user_id}")
+            continue
+
+        # Проверка прав администратора (поддержка нескольких админов)
+        admins = runtime_state.get("admins", [])
+        if int(user_id or 0) not in [int(x) for x in admins]:
             continue
 
         admin_chat_id = str(user_id)
@@ -334,9 +428,29 @@ def process_admin_commands(session: requests.Session, last_update_id: int, runti
                 "/help — показать список команд\n"
                 "/stats — статистика\n"
                 "/set_interval <сек> — интервал опроса админ-панели\n"
+                "/ping — проверка, что бот жив\n"
+                "/health — статус MAX/Telegram/прокси\n"
+                "/uptime — время работы бота\n"
+                "/version — версия бота\n"
+                "/pause — пауза пересылки MAX->Telegram\n"
+                "/resume — возобновить пересылку\n"
                 "/list_chats — список MAX чатов\n"
                 "/add_chat <id> — добавить MAX чат\n"
                 "/remove_chat <id> — удалить MAX чат\n"
+                "/clear_chats — очистить список MAX чатов\n"
+                "/set_chats <id1,id2,...> — заменить список MAX чатов\n"
+                "/last_chat_ids — последние chat_id, которые бот видел\n"
+                "/mute_chat <id> — временно замьютить чат (не пересылать)\n"
+                "/unmute_chat <id> — снять мьют\n"
+                "/only_text on|off — пересылать только текст (без медиа)\n"
+                "/set_tg_chat <chat_id> — изменить целевой Telegram chat_id\n"
+                "/where — показать текущие настройки (tg chat, admins)\n"
+                "/loglevel info|debug — уровень логов\n"
+                "/errors — последние ошибки\n"
+                "/tail <n> — последние события (n=1..50)\n"
+                "/allow_admin <id> — добавить админа\n"
+                "/disallow_admin <id> — удалить админа\n"
+                "/whoami — показать ваш Telegram ID\n"
                 "/test — тестовое сообщение в Telegram\n"
             )
 
@@ -350,6 +464,8 @@ def process_admin_commands(session: requests.Session, last_update_id: int, runti
                 f"Интервал опроса админ-панели: {runtime_state.get('poll_interval', POLL_INTERVAL)} сек\n"
                 f"Время последнего события MAX: {STATS.get('last_max_event_ts') or 'нет'}\n"
                 f"TG HTTP статус: {STATS.get('last_tg_http_status')}\n"
+                f"Пересылка включена: {runtime_state.get('forwarding_enabled', True)}\n"
+                f"Only text: {runtime_state.get('only_text', False)}\n"
             )
             send_text_to_telegram(session, admin_chat_id, stats_text, parse_mode="HTML")
 
@@ -363,12 +479,13 @@ def process_admin_commands(session: requests.Session, last_update_id: int, runti
                 if new_int <= 0:
                     raise ValueError
                 runtime_state["poll_interval"] = new_int
+                save_admin_state(runtime_state)
                 send_text_to_telegram(session, admin_chat_id, f"Интервал обновлён: {new_int} сек")
             except Exception:
                 send_text_to_telegram(session, admin_chat_id, "Некорректное значение. Пример: /set_interval 5")
 
         elif text.startswith("/test"):
-            ok = send_text_to_telegram(session, TELEGRAM_CHAT_ID, "Тест: сообщение из админ-панели MAX->Telegram.")
+            ok = send_text_to_telegram(session, runtime_state.get("telegram_chat_id", TELEGRAM_CHAT_ID), "Тест: сообщение из админ-панели MAX->Telegram.")
             send_text_to_telegram(
                 session,
                 admin_chat_id,
@@ -413,6 +530,185 @@ def process_admin_commands(session: requests.Session, last_update_id: int, runti
             except Exception:
                 send_text_to_telegram(session, admin_chat_id, "Не удалось удалить. Пример: /remove_chat -68776948203767")
 
+        elif text.startswith("/clear_chats"):
+            MAX_CHAT_IDS.clear()
+            save_max_chat_ids(MAX_CHAT_IDS)
+            send_text_to_telegram(session, admin_chat_id, "Список MAX чатов очищен.")
+
+        elif text.startswith("/set_chats"):
+            parts = text.split(maxsplit=1)
+            if len(parts) != 2:
+                send_text_to_telegram(session, admin_chat_id, "Использование: /set_chats <id1,id2,...>")
+                continue
+            try:
+                ids = [int(x.strip()) for x in parts[1].split(",") if x.strip()]
+                MAX_CHAT_IDS[:] = sorted(list(set(ids)))
+                save_max_chat_ids(MAX_CHAT_IDS)
+                send_text_to_telegram(session, admin_chat_id, f"Готово. Сейчас MAX_CHAT_IDS: {', '.join(map(str, MAX_CHAT_IDS)) if MAX_CHAT_IDS else '(пусто)'}")
+            except Exception:
+                send_text_to_telegram(session, admin_chat_id, "Ошибка. Пример: /set_chats -1,-2,-3")
+
+        elif text.startswith("/last_chat_ids"):
+            seen = list(runtime_state.get("last_seen_chat_ids", []))
+            send_text_to_telegram(
+                session,
+                admin_chat_id,
+                "Последние chat_id:\n" + ("\n".join(map(str, seen)) if seen else "(пусто)"),
+            )
+
+        elif text.startswith("/mute_chat"):
+            parts = text.split(maxsplit=1)
+            if len(parts) != 2:
+                send_text_to_telegram(session, admin_chat_id, "Использование: /mute_chat <chat_id>")
+                continue
+            try:
+                chat_id = int(parts[1].strip())
+                runtime_state["muted_chats"].add(chat_id)
+                save_admin_state(runtime_state)
+                send_text_to_telegram(session, admin_chat_id, f"Чат замьючен: {chat_id}")
+            except Exception:
+                send_text_to_telegram(session, admin_chat_id, "Ошибка. Пример: /mute_chat -68776948203767")
+
+        elif text.startswith("/unmute_chat"):
+            parts = text.split(maxsplit=1)
+            if len(parts) != 2:
+                send_text_to_telegram(session, admin_chat_id, "Использование: /unmute_chat <chat_id>")
+                continue
+            try:
+                chat_id = int(parts[1].strip())
+                runtime_state["muted_chats"].discard(chat_id)
+                save_admin_state(runtime_state)
+                send_text_to_telegram(session, admin_chat_id, f"Мьют снят: {chat_id}")
+            except Exception:
+                send_text_to_telegram(session, admin_chat_id, "Ошибка. Пример: /unmute_chat -68776948203767")
+
+        elif text.startswith("/only_text"):
+            parts = text.split(maxsplit=1)
+            if len(parts) != 2:
+                send_text_to_telegram(session, admin_chat_id, "Использование: /only_text on|off")
+                continue
+            val = parts[1].strip().lower()
+            if val in ["on", "1", "true", "yes"]:
+                runtime_state["only_text"] = True
+            elif val in ["off", "0", "false", "no"]:
+                runtime_state["only_text"] = False
+            else:
+                send_text_to_telegram(session, admin_chat_id, "Использование: /only_text on|off")
+                continue
+            save_admin_state(runtime_state)
+            send_text_to_telegram(session, admin_chat_id, f"Only text: {runtime_state['only_text']}")
+
+        elif text.startswith("/pause"):
+            runtime_state["forwarding_enabled"] = False
+            save_admin_state(runtime_state)
+            send_text_to_telegram(session, admin_chat_id, "Пересылка остановлена (pause).")
+
+        elif text.startswith("/resume"):
+            runtime_state["forwarding_enabled"] = True
+            save_admin_state(runtime_state)
+            send_text_to_telegram(session, admin_chat_id, "Пересылка возобновлена (resume).")
+
+        elif text.startswith("/ping"):
+            send_text_to_telegram(session, admin_chat_id, "pong")
+
+        elif text.startswith("/uptime"):
+            uptime = int(time.time() - runtime_state.get("start_time", time.time()))
+            send_text_to_telegram(session, admin_chat_id, f"Uptime: {uptime} sec")
+
+        elif text.startswith("/version"):
+            send_text_to_telegram(session, admin_chat_id, f"Bot version: {BOT_VERSION}")
+
+        elif text.startswith("/where"):
+            send_text_to_telegram(
+                session,
+                admin_chat_id,
+                "Текущие настройки:\n"
+                f"TELEGRAM_CHAT_ID: {runtime_state.get('telegram_chat_id', TELEGRAM_CHAT_ID)}\n"
+                f"Admins: {', '.join(map(str, runtime_state.get('admins', [])))}\n",
+            )
+
+        elif text.startswith("/set_tg_chat"):
+            parts = text.split(maxsplit=1)
+            if len(parts) != 2:
+                send_text_to_telegram(session, admin_chat_id, "Использование: /set_tg_chat <chat_id>")
+                continue
+            runtime_state["telegram_chat_id"] = parts[1].strip()
+            save_admin_state(runtime_state)
+            send_text_to_telegram(session, admin_chat_id, f"TELEGRAM_CHAT_ID обновлён: {runtime_state['telegram_chat_id']}")
+
+        elif text.startswith("/loglevel"):
+            parts = text.split(maxsplit=1)
+            if len(parts) != 2:
+                send_text_to_telegram(session, admin_chat_id, "Использование: /loglevel info|debug")
+                continue
+            lvl = parts[1].strip().lower()
+            if lvl not in ["info", "debug"]:
+                send_text_to_telegram(session, admin_chat_id, "Использование: /loglevel info|debug")
+                continue
+            runtime_state["loglevel"] = lvl
+            save_admin_state(runtime_state)
+            send_text_to_telegram(session, admin_chat_id, f"loglevel={lvl}")
+
+        elif text.startswith("/errors"):
+            errs = list(runtime_state.get("errors", []))[-10:]
+            send_text_to_telegram(session, admin_chat_id, "Последние ошибки:\n" + ("\n".join(errs) if errs else "(нет)"))
+
+        elif text.startswith("/tail"):
+            parts = text.split(maxsplit=1)
+            n = 10
+            if len(parts) == 2:
+                try:
+                    n = int(parts[1].strip())
+                except Exception:
+                    n = 10
+            n = max(1, min(50, n))
+            ev = list(runtime_state.get("events", []))[-n:]
+            send_text_to_telegram(session, admin_chat_id, "\n".join(ev) if ev else "(нет событий)")
+
+        elif text.startswith("/allow_admin"):
+            parts = text.split(maxsplit=1)
+            if len(parts) != 2:
+                send_text_to_telegram(session, admin_chat_id, "Использование: /allow_admin <telegram_id>")
+                continue
+            try:
+                aid = int(parts[1].strip())
+                runtime_state["admins"].add(aid)
+                save_admin_state(runtime_state)
+                send_text_to_telegram(session, admin_chat_id, f"Админ добавлен: {aid}")
+            except Exception:
+                send_text_to_telegram(session, admin_chat_id, "Ошибка. Пример: /allow_admin 123456789")
+
+        elif text.startswith("/disallow_admin"):
+            parts = text.split(maxsplit=1)
+            if len(parts) != 2:
+                send_text_to_telegram(session, admin_chat_id, "Использование: /disallow_admin <telegram_id>")
+                continue
+            try:
+                aid = int(parts[1].strip())
+                runtime_state["admins"].discard(aid)
+                save_admin_state(runtime_state)
+                send_text_to_telegram(session, admin_chat_id, f"Админ удалён: {aid}")
+            except Exception:
+                send_text_to_telegram(session, admin_chat_id, "Ошибка. Пример: /disallow_admin 123456789")
+
+        elif text.startswith("/health"):
+            # MAX статус
+            client = runtime_state.get("client")
+            max_ok = False
+            try:
+                max_ok = bool(getattr(client, "_connected", False))
+            except Exception:
+                max_ok = False
+            proxy = runtime_state.get("proxy", None)
+            send_text_to_telegram(
+                session,
+                admin_chat_id,
+                "HEALTH:\n"
+                f"MAX connected: {max_ok}\n"
+                f"Proxy: {proxy or 'none'}\n"
+                f"TG last status: {STATS.get('last_tg_http_status')}\n",
+            )
+
     return last_update_id
 
 
@@ -420,7 +716,7 @@ def process_admin_commands(session: requests.Session, last_update_id: int, runti
 # Интеграция с MaxClient (как в maxtg-master)
 # ============================================================
 
-def setup_max_client(tg_session: requests.Session) -> Client:
+def setup_max_client(tg_session: requests.Session, runtime_state: dict) -> Client:
     if not MAX_TOKEN:
         raise SystemExit("В .env не задан MAX_TOKEN (или MAX_API_TOKEN).")
     if not MAX_CHAT_IDS:
@@ -454,10 +750,21 @@ def setup_max_client(tg_session: requests.Session) -> Client:
             # Логируем только кратко, чтобы не спамить сильно
             preview = (message.text or "").replace("\n", " ")[:80]
             log(f"MAX message: chat_id={chat_id_raw} text='{preview}'")
+            _append_event(runtime_state, f"MAX msg chat_id={chat_id_raw} text='{preview}'")
+
+            # запоминаем последние seen chat_id
+            try:
+                runtime_state["last_seen_chat_ids"].append(chat_id_int if chat_id_int is not None else chat_id_raw)
+            except Exception:
+                pass
 
             if chat_id_int is None or chat_id_int not in MAX_CHAT_IDS:
                 return
             if getattr(message, "status", None) == "REMOVED":
+                return
+            if not runtime_state.get("forwarding_enabled", True):
+                return
+            if chat_id_int in runtime_state.get("muted_chats", set()):
                 return
 
             STATS["last_max_event_ts"] = _ts()
@@ -506,17 +813,17 @@ def setup_max_client(tg_session: requests.Session) -> Client:
             caption = f"<b>{safe_name}</b>\n{safe_chat_line}" + (f"\n{safe_text}" if safe_text else "")
 
             # Если есть вложения — используем sendMediaGroup из maxtg-master/telegram.py
-            if msg_attaches:
+            if msg_attaches and not runtime_state.get("only_text", False):
                 send_media_to_telegram(
                     TG_BOT_TOKEN=TELEGRAM_BOT_TOKEN,
-                    TG_CHAT_ID=int(TELEGRAM_CHAT_ID),
+                    TG_CHAT_ID=int(runtime_state.get("telegram_chat_id", TELEGRAM_CHAT_ID)),
                     caption=caption,
                     attachments=msg_attaches,
                 )
             else:
                 send_text_to_telegram(
                     tg_session,
-                    TELEGRAM_CHAT_ID,
+                    runtime_state.get("telegram_chat_id", TELEGRAM_CHAT_ID),
                     caption,
                     parse_mode="HTML",
                 )
@@ -524,6 +831,7 @@ def setup_max_client(tg_session: requests.Session) -> Client:
             STATS["forwarded_count"] = int(STATS.get("forwarded_count", 0)) + 1
         except Exception as e:
             log(f"Ошибка обработки входящего сообщения MAX: {e}")
+            _append_error(runtime_state, f"MAX handler error: {e}")
 
     return client
 
@@ -537,24 +845,64 @@ def main() -> None:
         raise SystemExit("В .env нужно задать TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID.")
 
     tg_session = _build_tg_session()
-    client = setup_max_client(tg_session)
+    # runtime state для админки и обработчиков
+    state_from_file = load_admin_state()
+    runtime_state = {
+        "start_time": time.time(),
+        "poll_interval": POLL_INTERVAL,
+        "tg_backoff_sec": 0,
+        "forwarding_enabled": True,
+        "only_text": False,
+        "loglevel": "info",
+        "telegram_chat_id": TELEGRAM_CHAT_ID,
+        "admins": set([ADMIN_TELEGRAM_ID]) if ADMIN_TELEGRAM_ID else set(),
+        "muted_chats": set(),
+        "events": deque(maxlen=200),
+        "errors": deque(maxlen=100),
+        "last_seen_chat_ids": deque(maxlen=30),
+        "proxy": _build_proxy_url(),
+    }
+
+    # применяем состояние из файла
+    if state_from_file:
+        try:
+            if state_from_file.get("telegram_chat_id"):
+                runtime_state["telegram_chat_id"] = str(state_from_file["telegram_chat_id"])
+            if isinstance(state_from_file.get("admins"), list):
+                runtime_state["admins"] |= set(int(x) for x in state_from_file["admins"])
+            if isinstance(state_from_file.get("muted_chats"), list):
+                runtime_state["muted_chats"] |= set(int(x) for x in state_from_file["muted_chats"])
+            if "forwarding_enabled" in state_from_file:
+                runtime_state["forwarding_enabled"] = bool(state_from_file["forwarding_enabled"])
+            if "only_text" in state_from_file:
+                runtime_state["only_text"] = bool(state_from_file["only_text"])
+            if state_from_file.get("loglevel"):
+                runtime_state["loglevel"] = str(state_from_file["loglevel"])
+        except Exception:
+            pass
+
+    client = setup_max_client(tg_session, runtime_state)
+    runtime_state["client"] = client
+    save_admin_state(runtime_state)
 
     # Запускаем MaxClient (он сам создаёт потоки слушателя и heartbeat)
     client.run()
 
     log("Бот MAX->Telegram запущен (WebSocket).")
     log(f"Админ Telegram ID: {ADMIN_TELEGRAM_ID}")
-    log(f"Telegram target chat_id: {TELEGRAM_CHAT_ID}")
+    log(f"Telegram target chat_id: {runtime_state.get('telegram_chat_id', TELEGRAM_CHAT_ID)}")
     log(f"MAX chat ids: {MAX_CHAT_IDS}")
+    _append_event(runtime_state, "Bot started")
 
     # Цикл админ-панели
-    runtime_state = {"poll_interval": POLL_INTERVAL}
     last_update_id = 0
 
     try:
         while True:
             last_update_id = process_admin_commands(tg_session, last_update_id, runtime_state)
-            time.sleep(int(runtime_state.get("poll_interval", 5)))
+            base = int(runtime_state.get("poll_interval", 5))
+            backoff = int(runtime_state.get("tg_backoff_sec", 0))
+            time.sleep(max(1, base + backoff))
     except KeyboardInterrupt:
         log("Остановка (Ctrl+C).")
         try:

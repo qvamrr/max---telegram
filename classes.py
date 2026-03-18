@@ -82,37 +82,10 @@ class Chat:
         self._client = client
         self.id: int = chat_id
         self.link = f"https://web.max.ru/{chat_id}"
-
-        seq = client.seq
-        client.websocket.send(
-            json.dumps(
-                {
-                    "ver": 11,
-                    "cmd": 0,
-                    "seq": seq,
-                    "opcode": 49,
-                    "payload": {
-                        "chatId": chat_id,
-                        "from": int(time.time() * 1000),
-                        "forward": 0,
-                        "backward": 30,
-                        "getMessages": True,
-                    },
-                }
-            )
-        )
-        while True:
-            r = client.websocket.recv()
-            recv = json.loads(r)
-            if recv["seq"] == seq and recv["opcode"] == 49:
-                break
-
-        payload = recv["payload"]
-        _ = []
-        for msg in payload.get("messages", []):
-            m = Message(client, 0, **msg, _f=1)
-            _.append(m)
-        self.messages: list[Message] = _
+        # В этом проекте история сообщений чата не нужна.
+        # Важно: загрузка истории (opcode=49) конкурирует за websocket.recv() и может приводить
+        # к пропуску входящих событий при высокой нагрузке. Поэтому здесь только ссылка/id.
+        self.messages: list[Message] = []
 
     def pin(self):
         self._client.pin_chat(self.id)
