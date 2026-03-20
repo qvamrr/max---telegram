@@ -910,8 +910,77 @@ def main() -> None:
         except Exception:
             pass
 
-
 if __name__ == "__main__":
     main()
 
+
+# ============================================================
+# main
+# ============================================================
+
+def main() -> None:
+    # 1. Проверка базовых настроек
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise SystemExit("В .env нужно задать TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID.")
+
+    # 2. Инициализация сессии и состояния
+    tg_session = _build_tg_session()
+    runtime_state = {"poll_interval": POLL_INTERVAL}
+
+    try:
+        # 3. ИСПРАВЛЕННЫЙ ВЫЗОВ: передаем ОБА аргумента (сессию и состояние)
+        # Это устраняет ошибку TypeError: setup_max_client() missing 1 ...
+        client = setup_max_client(tg_session, runtime_state)
+    except Exception as e:
+        log(f"ОШИБКА инициализации клиента Max: {e}")
+        sys.exit(1)
+
+    # 4. ЗАПУСК В ПОТОКЕ
+    # Мы запускаем client.run() в фоне, чтобы основной цикл не блокировался
+    max_thread = threading.Thread(target=client.run, daemon=True)
+    max_thread.start()
+
+    log("Бот MAX->Telegram запущен (WebSocket + Heartbeat thread).")
+    log(f"Админ Telegram ID: {ADMIN_TELEGRAM_ID}")
+    log(f"MAX chat ids: {MAX_CHAT_IDS}")
+
+    # Переменные для управления циклом
+    last_update_id = 0
+    last_heartbeat_time = time.time()
+
+    try:
+        while True:
+            # 5. Админ-панель (обработка команд из Telegram)
+            last_update_id = process_admin_commands(tg_session, last_update_id, runtime_state)
+            
+            # 6. HEARTBEAT (проверка связи раз в 5 минут)
+            current_time = time.time()
+            if current_time - last_heartbeat_time > 300:
+                try:
+                    # Пытаемся вызвать API, чтобы проверить, не "протух" ли WebSocket
+                    me = client.get_me()
+                    if me:
+                        log(f"Heartbeat OK: Соединение активно (ID: {me.contact.id})")
+                    else:
+                        raise Exception("API Max вернул пустой ответ")
+                    
+                    last_heartbeat_time = current_time
+                except Exception as e:
+                    log(f"CRITICAL: Heartbeat failed! Соединение потеряно: {e}")
+                    # Выходим с кодом 1, чтобы systemd перезапустил бота целиком
+                    os._exit(1) 
+
+            # Пауза между итерациями цикла админки
+            time.sleep(int(runtime_state.get("poll_interval", 5)))
+
+    except KeyboardInterrupt:
+        log("Остановка пользователем (Ctrl+C).")
+        os._exit(0)
+    except Exception as e:
+        log(f"Непредвиденная ошибка в основном цикле: {e}")
+        os._exit(1)
+
+
+if __name__ == "__main__":
+    main()
 
