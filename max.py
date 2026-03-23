@@ -19,13 +19,20 @@ class MaxClient:
         self._on_connect = None
         self._connected = False
         self._t = None
+        self._heartbeat_thread = None
         self._t_stop = False
+        self._connect_lock = threading.Lock()
 
         self.is_log_in = False
         self.me = None
         self.session_id = int(time.time() * 1000)
+        self.last_connect_ts = None
+        self.last_recv_ts = None
+        self.last_error = None
+        self.reconnect_count = 0
 
         self.handlers = []
+        self._user_cache: dict[int, User] = {}
 
     @property
     def seq(self):
@@ -62,65 +69,106 @@ class MaxClient:
         )
 
     def connect(self):
-        if self._connected:
-            return
+        with self._connect_lock:
+            if self._connected and self.websocket is not None:
+                return
 
-        headers = [
-            ("Origin", "https://web.oneme.ru"),
-            ("Pragma", "no-cache"),
-            ("Cache-Control", "no-cache"),
-            (
-                "User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36",
-            ),
-        ]
-        self.websocket = connect("wss://ws-api.oneme.ru/websocket", additional_headers=headers)
-        self.websocket.send(self.user_agent)
-        self.websocket.recv()
+            headers = [
+                ("Origin", "https://web.oneme.ru"),
+                ("Pragma", "no-cache"),
+                ("Cache-Control", "no-cache"),
+                (
+                    "User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36",
+                ),
+            ]
 
-        self.websocket.send(
-            json.dumps(
-                {
-                    "ver": 11,
-                    "cmd": 0,
-                    "seq": self.seq,
-                    "opcode": 19,
-                    "payload": {
-                        "interactive": True,
-                        "token": self.auth_token,
-                        "chatsSync": 0,
-                        "contactsSync": 0,
-                        "presenceSync": 0,
-                        "draftsSync": 0,
-                        "chatsCount": 40,
-                    },
-                }
-            )
-        )
+            ws = None
+            try:
+                ws = connect(
+                    "wss://ws-api.oneme.ru/websocket",
+                    additional_headers=headers,
+                    ping_interval=None,
+                    ping_timeout=None,
+                )
+                ws.send(self.user_agent)
+                ws.recv()
 
-        first = json.loads(self.websocket.recv())
-        p = first.get("payload") or {}
-        # Иногда сервер может вернуть ошибку/другой payload без profile
-        if "profile" not in p:
-            raise RuntimeError(f"MAX connect: нет profile в ответе. opcode={first.get('opcode')} payload={str(p)[:300]}")
-        usr = User(self, p["profile"])
-        self.me = usr
-        self._connected = True
+                ws.send(
+                    json.dumps(
+                        {
+                            "ver": 11,
+                            "cmd": 0,
+                            "seq": self.seq,
+                            "opcode": 19,
+                            "payload": {
+                                "interactive": True,
+                                "token": self.auth_token,
+                                "chatsSync": 0,
+                                "contactsSync": 0,
+                                "presenceSync": 0,
+                                "draftsSync": 0,
+                                "chatsCount": 40,
+                            },
+                        }
+                    )
+                )
 
-        if self._on_connect:
-            self._on_connect()
+                first = json.loads(ws.recv())
+                payload = first.get("payload") or {}
+                if "profile" not in payload:
+                    raise RuntimeError(
+                        f"MAX connect: no profile in response. opcode={first.get('opcode')} payload={str(payload)[:300]}"
+                    )
+
+                self.websocket = ws
+                self.me = User(self, payload["profile"])
+                self._connected = True
+                now = time.time()
+                self.last_connect_ts = now
+                self.last_recv_ts = now
+                self.last_error = None
+
+                if self._on_connect:
+                    self._on_connect()
+            except Exception as e:
+                self.last_error = str(e)
+                self._connected = False
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                raise
 
     def disconnect(self):
-        if not self._connected:
-            return
-        if self.websocket:
-            self.websocket.close()
-            self._seq = 0
-        self._connected = False
+        ws = self.websocket
         self.websocket = None
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        self._seq = 0
+        self._connected = False
 
     def set_token(self, token):
         self.auth_token = token
+
+    def is_connected(self) -> bool:
+        return bool(self._connected and self.websocket is not None)
+
+    def ensure_connected(self):
+        while not self._t_stop:
+            if self.is_connected():
+                return
+            try:
+                self.connect()
+            except Exception as e:
+                self.last_error = str(e)
+                time.sleep(5)
+            else:
+                return
 
     def _hlprocessor(self, msg: Message):
         for filter_func, func in self.handlers:
@@ -129,7 +177,10 @@ class MaxClient:
                 return
 
     def _heartbeat(self):
-        while self._connected and not self._t_stop:
+        while not self._t_stop:
+            if not self.is_connected():
+                time.sleep(1)
+                continue
             try:
                 self.websocket.send(
                     json.dumps(
@@ -142,40 +193,48 @@ class MaxClient:
                         }
                     )
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                self.last_error = str(e)
+                self._connected = False
             time.sleep(25)
 
     def _listener(self):
         while not self._t_stop:
+            if not self.is_connected():
+                self.ensure_connected()
+                time.sleep(0.2)
+                continue
+
             try:
                 recv = json.loads(self.websocket.recv())
+                self.last_recv_ts = time.time()
                 self._process_message(recv)
 
                 while True:
                     try:
                         next_msg = json.loads(self.websocket.recv(timeout=0.01))
+                        self.last_recv_ts = time.time()
                         self._process_message(next_msg)
                     except TimeoutError:
                         break
                     except ConnectionClosedError:
                         break
-            except ConnectionClosedError:
+            except (ConnectionClosedError, OSError) as e:
+                self.last_error = str(e)
                 self._connected = False
                 try:
                     if self.websocket:
                         self.websocket.close()
                 except Exception:
                     pass
+                self.websocket = None
+                self.reconnect_count += 1
                 time.sleep(3)
-                try:
-                    self.connect()
-                except Exception:
-                    time.sleep(5)
-                else:
-                    break
-            except Exception:
+                continue
+            except Exception as e:
+                self.last_error = str(e)
                 self._connected = False
+                self.websocket = None
                 time.sleep(5)
                 continue
 
@@ -187,14 +246,18 @@ class MaxClient:
             try:
                 msg = Message(self, payload["chatId"], **payload["message"])
                 self._hlprocessor(msg)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"MAX message parse error: {e}", flush=True)
 
     def run(self):
-        self.connect()
-        self._t = threading.Thread(target=self._listener, name="WebMaxListener", daemon=True)
-        self._t.start()
-        threading.Thread(target=self._heartbeat, name="WebMaxHeartbeat", daemon=True).start()
+        self._t_stop = False
+        self.ensure_connected()
+        if self._t is None or not self._t.is_alive():
+            self._t = threading.Thread(target=self._listener, name="WebMaxListener", daemon=True)
+            self._t.start()
+        if self._heartbeat_thread is None or not self._heartbeat_thread.is_alive():
+            self._heartbeat_thread = threading.Thread(target=self._heartbeat, name="WebMaxHeartbeat", daemon=True)
+            self._heartbeat_thread.start()
 
     def stop(self):
         self._t_stop = True
@@ -211,18 +274,27 @@ class MaxClient:
         self._on_connect = func
         return func
 
-    # Минимально нужное для нашего проекта
     def get_user(self, **kwargs):
         id_ = kwargs.get("id")
         _f = kwargs.get("_f")
+        try:
+            cid = int(id_)
+        except Exception:
+            cid = None
+
+        if cid is not None and cid in self._user_cache:
+            return self._user_cache[cid]
+
         seq = self.seq
-        j = {"ver": 11, "cmd": 0, "seq": seq, "opcode": 32, "payload": {"contactIds": [id_]}}
-        self.websocket.send(json.dumps(j))
+        payload = {"ver": 11, "cmd": 0, "seq": seq, "opcode": 32, "payload": {"contactIds": [id_]}}
+        self.websocket.send(json.dumps(payload))
         while True:
             recv = json.loads(self.websocket.recv())
+            self.last_recv_ts = time.time()
             if recv["seq"] == seq:
                 break
-        payload = recv["payload"]
-        contact = payload["contacts"][0]
-        return User(self, contact, _f)
-
+        contact = recv["payload"]["contacts"][0]
+        user = User(self, contact, _f)
+        if cid is not None:
+            self._user_cache[cid] = user
+        return user

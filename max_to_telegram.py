@@ -182,6 +182,11 @@ try:
 except ValueError:
     ADMIN_TELEGRAM_ID = 0
 
+try:
+    MAX_SILENCE_RESTART_SECONDS = int(os.environ.get("MAX_SILENCE_RESTART_SECONDS", "900").strip())
+except ValueError:
+    MAX_SILENCE_RESTART_SECONDS = 900
+
 # --- Proxy (Telegram only) ---
 PROXY_URL = os.environ.get("PROXY_URL", "").strip()
 PROXY_USERNAME = os.environ.get("PROXY_USERNAME", "").strip()
@@ -256,6 +261,31 @@ def save_admin_state(runtime_state: dict) -> None:
         os.replace(tmp, ADMIN_STATE_FILE)
     except Exception as e:
         log(f"Не удалось сохранить {ADMIN_STATE_FILE}: {e}")
+
+
+def build_runtime_state() -> dict:
+    stored = load_admin_state()
+    admins = {int(x) for x in stored.get("admins", []) if str(x).lstrip("-").isdigit()}
+    if ADMIN_TELEGRAM_ID:
+        admins.add(ADMIN_TELEGRAM_ID)
+
+    return {
+        "poll_interval": POLL_INTERVAL,
+        "telegram_chat_id": str(stored.get("telegram_chat_id") or TELEGRAM_CHAT_ID),
+        "admins": admins,
+        "muted_chats": {int(x) for x in stored.get("muted_chats", [])},
+        "forwarding_enabled": bool(stored.get("forwarding_enabled", True)),
+        "only_text": bool(stored.get("only_text", False)),
+        "loglevel": stored.get("loglevel", "info"),
+        "events": deque(maxlen=200),
+        "errors": deque(maxlen=100),
+        "last_seen_chat_ids": deque(maxlen=50),
+        "tg_backoff_sec": 0,
+        "start_time": time.time(),
+        "last_max_message_ts": None,
+        "proxy": _build_proxy_url(),
+        "client": None,
+    }
 
 # ============================================================
 # Telegram helpers (для текста и админки)
@@ -692,11 +722,18 @@ def process_admin_commands(session: requests.Session, last_update_id: int, runti
                 send_text_to_telegram(session, admin_chat_id, "Ошибка. Пример: /disallow_admin 123456789")
 
         elif text.startswith("/health"):
-            # MAX статус
             client = runtime_state.get("client")
             max_ok = False
+            reconnects = 0
+            last_error = "-"
+            last_recv_age = "n/a"
             try:
-                max_ok = bool(getattr(client, "_connected", False))
+                max_ok = bool(client and client.is_connected())
+                reconnects = int(getattr(client, "reconnect_count", 0))
+                last_error = str(getattr(client, "last_error", "-") or "-")
+                last_recv_ts = getattr(client, "last_recv_ts", None)
+                if last_recv_ts:
+                    last_recv_age = f"{int(time.time() - last_recv_ts)} sec"
             except Exception:
                 max_ok = False
             proxy = runtime_state.get("proxy", None)
@@ -705,6 +742,9 @@ def process_admin_commands(session: requests.Session, last_update_id: int, runti
                 admin_chat_id,
                 "HEALTH:\n"
                 f"MAX connected: {max_ok}\n"
+                f"MAX reconnects: {reconnects}\n"
+                f"MAX last recv age: {last_recv_age}\n"
+                f"MAX last error: {last_error}\n"
                 f"Proxy: {proxy or 'none'}\n"
                 f"TG last status: {STATS.get('last_tg_http_status')}\n",
             )
@@ -723,9 +763,12 @@ def setup_max_client(tg_session: requests.Session, runtime_state: dict) -> Clien
         raise SystemExit("В .env не задан MAX_CHAT_IDS (список ID чатов через запятую).")
 
     client = Client(MAX_TOKEN)
+    runtime_state["client"] = client
 
     @client.on_connect
     def _on_connect():
+        runtime_state["last_max_message_ts"] = time.time()
+        _append_event(runtime_state, "MAX connected")
         if client.me is not None:
             log(
                 f"MAX подключен. Имя: {client.me.contact.names[0].name}, "
@@ -768,6 +811,7 @@ def setup_max_client(tg_session: requests.Session, runtime_state: dict) -> Clien
                 return
 
             STATS["last_max_event_ts"] = _ts()
+            runtime_state["last_max_message_ts"] = time.time()
 
             msg_text = message.text or ""
             msg_attaches = message.attaches or []
@@ -841,137 +885,60 @@ def setup_max_client(tg_session: requests.Session, runtime_state: dict) -> Clien
 # ============================================================
 
 def main() -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise SystemExit("В .env нужно задать TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID.")
-
-    tg_session = _build_tg_session()
-    # runtime state для админки и обработчиков
-    state_from_file = load_admin_state()
-    runtime_state = {
-        "start_time": time.time(),
-        "poll_interval": POLL_INTERVAL,
-        "tg_backoff_sec": 0,
-        "forwarding_enabled": True,
-        "only_text": False,
-        "loglevel": "info",
-        "telegram_chat_id": TELEGRAM_CHAT_ID,
-        "admins": set([ADMIN_TELEGRAM_ID]) if ADMIN_TELEGRAM_ID else set(),
-        "muted_chats": set(),
-        "events": deque(maxlen=200),
-        "errors": deque(maxlen=100),
-        "last_seen_chat_ids": deque(maxlen=30),
-        "proxy": _build_proxy_url(),
-    }
-
-    # применяем состояние из файла
-    if state_from_file:
-        try:
-            if state_from_file.get("telegram_chat_id"):
-                runtime_state["telegram_chat_id"] = str(state_from_file["telegram_chat_id"])
-            if isinstance(state_from_file.get("admins"), list):
-                runtime_state["admins"] |= set(int(x) for x in state_from_file["admins"])
-            if isinstance(state_from_file.get("muted_chats"), list):
-                runtime_state["muted_chats"] |= set(int(x) for x in state_from_file["muted_chats"])
-            if "forwarding_enabled" in state_from_file:
-                runtime_state["forwarding_enabled"] = bool(state_from_file["forwarding_enabled"])
-            if "only_text" in state_from_file:
-                runtime_state["only_text"] = bool(state_from_file["only_text"])
-            if state_from_file.get("loglevel"):
-                runtime_state["loglevel"] = str(state_from_file["loglevel"])
-        except Exception:
-            pass
-
-    client = setup_max_client(tg_session, runtime_state)
-    runtime_state["client"] = client
-    save_admin_state(runtime_state)
-
-    # Запускаем MaxClient (он сам создаёт потоки слушателя и heartbeat)
-    client.run()
-
-    log("Бот MAX->Telegram запущен (WebSocket).")
-    log(f"Админ Telegram ID: {ADMIN_TELEGRAM_ID}")
-    log(f"Telegram target chat_id: {runtime_state.get('telegram_chat_id', TELEGRAM_CHAT_ID)}")
-    log(f"MAX chat ids: {MAX_CHAT_IDS}")
-    _append_event(runtime_state, "Bot started")
-
-    # Цикл админ-панели
-    last_update_id = 0
-
-    try:
-        while True:
-            last_update_id = process_admin_commands(tg_session, last_update_id, runtime_state)
-            base = int(runtime_state.get("poll_interval", 5))
-            backoff = int(runtime_state.get("tg_backoff_sec", 0))
-            time.sleep(max(1, base + backoff))
-    except KeyboardInterrupt:
-        log("Остановка (Ctrl+C).")
-        try:
-            client.stop()
-        except Exception:
-            pass
-
-if __name__ == "__main__":
-    main()
-
-
-# ============================================================
-# main
-# ============================================================
-
-def main() -> None:
     # 1. Проверка базовых настроек
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         raise SystemExit("В .env нужно задать TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID.")
 
     # 2. Инициализация сессии и состояния
     tg_session = _build_tg_session()
-    runtime_state = {"poll_interval": POLL_INTERVAL}
+    runtime_state = build_runtime_state()
 
     try:
-        # 3. ИСПРАВЛЕННЫЙ ВЫЗОВ: передаем ОБА аргумента (сессию и состояние)
-        # Это устраняет ошибку TypeError: setup_max_client() missing 1 ...
         client = setup_max_client(tg_session, runtime_state)
     except Exception as e:
         log(f"ОШИБКА инициализации клиента Max: {e}")
         sys.exit(1)
 
-    # 4. ЗАПУСК В ПОТОКЕ
-    # Мы запускаем client.run() в фоне, чтобы основной цикл не блокировался
-    max_thread = threading.Thread(target=client.run, daemon=True)
-    max_thread.start()
+    client.run()
 
     log("Бот MAX->Telegram запущен (WebSocket + Heartbeat thread).")
     log(f"Админ Telegram ID: {ADMIN_TELEGRAM_ID}")
     log(f"MAX chat ids: {MAX_CHAT_IDS}")
+    if runtime_state.get("admins"):
+        log(f"Admins: {sorted(runtime_state['admins'])}")
 
-    # Переменные для управления циклом
     last_update_id = 0
-    last_heartbeat_time = time.time()
+    last_health_log_time = 0.0
 
     try:
         while True:
-            # 5. Админ-панель (обработка команд из Telegram)
             last_update_id = process_admin_commands(tg_session, last_update_id, runtime_state)
-            
-            # 6. HEARTBEAT (проверка связи раз в 5 минут)
             current_time = time.time()
-            if current_time - last_heartbeat_time > 300:
-                try:
-                    # Пытаемся вызвать API, чтобы проверить, не "протух" ли WebSocket
-                    me = client.get_me()
-                    if me:
-                        log(f"Heartbeat OK: Соединение активно (ID: {me.contact.id})")
-                    else:
-                        raise Exception("API Max вернул пустой ответ")
-                    
-                    last_heartbeat_time = current_time
-                except Exception as e:
-                    log(f"CRITICAL: Heartbeat failed! Соединение потеряно: {e}")
-                    # Выходим с кодом 1, чтобы systemd перезапустил бота целиком
-                    os._exit(1) 
 
-            # Пауза между итерациями цикла админки
-            time.sleep(int(runtime_state.get("poll_interval", 5)))
+            if current_time - last_health_log_time >= 300:
+                connected = bool(getattr(client, "is_connected", lambda: False)())
+                last_recv = getattr(client, "last_recv_ts", None)
+                silence = int(current_time - last_recv) if last_recv else None
+                log(
+                    "MAX health: "
+                    f"connected={connected}, "
+                    f"reconnects={getattr(client, 'reconnect_count', 0)}, "
+                    f"last_recv_age={silence if silence is not None else 'n/a'} sec"
+                )
+                last_health_log_time = current_time
+
+            last_recv = getattr(client, "last_recv_ts", None)
+            silent_for = (current_time - last_recv) if last_recv else None
+            if not client.is_connected():
+                log(f"CRITICAL: MAX disconnected. Last error: {getattr(client, 'last_error', 'unknown')}")
+                os._exit(1)
+            if silent_for is not None and silent_for > MAX_SILENCE_RESTART_SECONDS:
+                log(f"CRITICAL: MAX silent for {int(silent_for)} sec. Restarting process.")
+                os._exit(1)
+
+            backoff = int(runtime_state.get("tg_backoff_sec", 0))
+            sleep_for = max(1, backoff or int(runtime_state.get("poll_interval", 5)))
+            time.sleep(sleep_for)
 
     except KeyboardInterrupt:
         log("Остановка пользователем (Ctrl+C).")
