@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-MAX -> Telegram forwarder (WebSocket, как в maxtg-master).
+MAX -> Telegram forwarder (WebSocket, как в ).
 
 Что делает:
   - Подключается к MAX по токену через библиотеку (max.py / MaxClient).
@@ -13,7 +13,7 @@ MAX -> Telegram forwarder (WebSocket, как в maxtg-master).
 
 Важно:
   - Никакого собственного HTTP API для MAX не нужно.
-  - Вся работа с MAX идёт через WebSocket внутри MaxClient (как в maxtg-master).
+  - Вся работа с MAX идёт через WebSocket внутри MaxClient.
 """
 
 import os
@@ -753,7 +753,7 @@ def process_admin_commands(session: requests.Session, last_update_id: int, runti
 
 
 # ============================================================
-# Интеграция с MaxClient (как в maxtg-master)
+# Интеграция с MaxClient
 # ============================================================
 
 def setup_max_client(tg_session: requests.Session, runtime_state: dict) -> Client:
